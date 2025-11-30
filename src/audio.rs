@@ -18,7 +18,6 @@ pub struct AudioRecorder {
     worker_handle: Option<thread::JoinHandle<()>>,
 }
 
-// AudioRecorder is Send because mpsc::Sender is Send and JoinHandle is Send.
 unsafe impl Send for AudioRecorder {}
 
 impl AudioRecorder {
@@ -96,13 +95,22 @@ fn run_audio_thread(
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
 
-    info!("Audio device: {:?}, Rate: {}, Channels: {}", device.name().unwrap_or_default(), sample_rate, channels);
+    info!("Audio device: {:?}, Rate: {}, Channels: {}, Format: {:?}", device.name().unwrap_or_default(), sample_rate, channels, config.sample_format());
 
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config.into(), sample_tx, channels),
         cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config.into(), sample_tx, channels),
         cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config.into(), sample_tx, channels),
-        _ => return Err(anyhow::anyhow!("Unsupported sample format")),
+        cpal::SampleFormat::I8 => build_stream::<i8>(&device, &config.into(), sample_tx, channels),
+        cpal::SampleFormat::U8 => build_stream::<u8>(&device, &config.into(), sample_tx, channels),
+        cpal::SampleFormat::I32 => build_stream::<i32>(&device, &config.into(), sample_tx, channels),
+        cpal::SampleFormat::U32 => build_stream::<u32>(&device, &config.into(), sample_tx, channels),
+        cpal::SampleFormat::F64 => build_stream::<f64>(&device, &config.into(), sample_tx, channels),
+        cpal::SampleFormat::I64 => build_stream::<i64>(&device, &config.into(), sample_tx, channels),
+        cpal::SampleFormat::U64 => build_stream::<u64>(&device, &config.into(), sample_tx, channels),
+        // I24 is tricky, often requires manual handling or specific crate features.
+        // cpal::Sample is not implemented for any i24 type usually.
+        _ => return Err(anyhow::anyhow!("Unsupported sample format: {:?}", config.sample_format())),
     }?;
 
     stream.play()?;
@@ -111,7 +119,6 @@ fn run_audio_thread(
     let mut recording = false;
 
     loop {
-        // Check commands
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Start => {
@@ -182,6 +189,7 @@ fn get_preferred_config(device: &Device) -> Result<cpal::SupportedStreamConfig> 
              return Ok(config.with_sample_rate(cpal::SampleRate(WHISPER_SAMPLE_RATE)));
         }
     }
+    // Fallback
     Ok(device.default_input_config()?)
 }
 
