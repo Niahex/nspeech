@@ -7,8 +7,13 @@ use std::time::{Duration, Instant};
 use log::{error, info};
 
 pub const WHISPER_SAMPLE_RATE: u32 = 16000;
-const SILENCE_THRESHOLD: f32 = 0.01; // Seuil d'amplitude pour considérer "silence"
-const SILENCE_DURATION_MS: u128 = 2000; // Arrêt après 2 secondes de silence
+const SILENCE_THRESHOLD: f32 = 0.01; 
+const SILENCE_DURATION_MS: u128 = 2000; 
+
+// Nouvel enum pour les événements sortants
+pub enum AudioEvent {
+    AutoStopped(Vec<f32>),
+}
 
 enum Cmd {
     Start,
@@ -24,21 +29,19 @@ pub struct AudioRecorder {
 unsafe impl Send for AudioRecorder {}
 
 impl AudioRecorder {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
+    // On passe un Sender pour recevoir les événements automatiques
+    pub fn new(event_tx: mpsc::Sender<AudioEvent>) -> Result<Self> {
+        let mut recorder = Self {
             cmd_tx: None,
             worker_handle: None,
-        })
+        };
+        recorder.init_stream(event_tx)?;
+        Ok(recorder)
     }
 
     pub fn start_recording(&mut self) -> Result<()> {
         if let Some(tx) = &self.cmd_tx {
-            tx.send(Cmd::Start).map_err(|e| anyhow::anyhow!("Failed to send Start command: {}", e))?;
-        } else {
-            self.init_stream()?;
-            if let Some(tx) = &self.cmd_tx {
-                 tx.send(Cmd::Start).map_err(|e| anyhow::anyhow!("Failed to send Start command: {}", e))?;
-            }
+            tx.send(Cmd::Start).map_err(|e| anyhow::anyhow!("Failed to send Start: {}", e))?;
         }
         Ok(())
     }
@@ -46,28 +49,22 @@ impl AudioRecorder {
     pub fn stop_recording(&mut self) -> Result<Vec<f32>> {
         let (resp_tx, resp_rx) = mpsc::channel();
         if let Some(tx) = &self.cmd_tx {
-            tx.send(Cmd::Stop(resp_tx)).map_err(|e| anyhow::anyhow!("Failed to send Stop command: {}", e))?;
+            tx.send(Cmd::Stop(resp_tx)).map_err(|e| anyhow::anyhow!("Failed to send Stop: {}", e))?;
             let samples = resp_rx.recv().map_err(|e| anyhow::anyhow!("Failed to receive samples: {}", e))?;
             return Ok(samples);
         }
         Ok(Vec::new())
     }
 
-    fn init_stream(&mut self) -> Result<()> {
-        if self.worker_handle.is_some() {
-            return Ok(());
-        }
-
+    fn init_stream(&mut self, event_tx: mpsc::Sender<AudioEvent>) -> Result<()> {
         let host = cpal::default_host();
         let device = host.default_input_device().ok_or(anyhow::anyhow!("No input device found"))?;
 
         let (sample_tx, sample_rx) = mpsc::channel::<Vec<f32>>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
-        // Canal pour notifier l'arrêt automatique au thread principal (optionnel, ici géré par polling)
-        // Pour simplifier, l'auto-stop arrête l'enregistrement interne, et le prochain "stop_recording" récupérera tout.
-        
+
         let worker = thread::spawn(move || {
-            if let Err(e) = run_audio_thread(device, sample_tx, sample_rx, cmd_rx) {
+            if let Err(e) = run_audio_thread(device, sample_tx, sample_rx, cmd_rx, event_tx) {
                 error!("Audio thread error: {}", e);
             }
         });
@@ -95,12 +92,13 @@ fn run_audio_thread(
     sample_tx: mpsc::Sender<Vec<f32>>,
     sample_rx: mpsc::Receiver<Vec<f32>>,
     cmd_rx: mpsc::Receiver<Cmd>,
+    event_tx: mpsc::Sender<AudioEvent>, // Nouveau canal
 ) -> Result<()> {
     let config = get_preferred_config(&device)?;
     let sample_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
 
-    info!("Audio device: {:?}, Rate: {}, Channels: {}, Format: {:?}", device.name().unwrap_or_default(), sample_rate, channels, config.sample_format());
+    info!("Audio device: {:?}, Rate: {}, Channels: {}", device.name().unwrap_or_default(), sample_rate, channels);
 
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config.into(), sample_tx, channels),
@@ -121,10 +119,9 @@ fn run_audio_thread(
     let mut buffer = Vec::with_capacity(16000 * 600);
     let mut recording = false;
     let mut last_speech_time = Instant::now();
-    // let mut silence_start_time = None; // Pourrait être utilisé pour un calcul plus précis
 
     loop {
-        // 1. Traitement des commandes
+        // 1. Commandes
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Start => {
@@ -135,45 +132,41 @@ fn run_audio_thread(
                 }
                 Cmd::Stop(reply_tx) => {
                     recording = false;
-                    info!("Recording stopped, capturing {} samples", buffer.len());
-                    
-                    let mut final_samples = if sample_rate != WHISPER_SAMPLE_RATE {
-                         resample_simple(&buffer, sample_rate, WHISPER_SAMPLE_RATE)
-                    } else {
-                        buffer.clone()
-                    };
-                    
-                    // Trim silence before sending
+                    let mut final_samples = process_buffer(&buffer, sample_rate);
                     trim_silence(&mut final_samples, SILENCE_THRESHOLD);
-                    
                     let _ = reply_tx.send(final_samples);
                 }
                 Cmd::Shutdown => break,
             }
         }
 
-        // 2. Réception et traitement des données audio
+        // 2. Audio
         match sample_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(chunk) => {
                 if recording {
-                    // Analyse d'activité (VAD simple basé sur l'amplitude)
                     let max_amplitude = chunk.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
                     
                     if max_amplitude > SILENCE_THRESHOLD {
                         last_speech_time = Instant::now();
                     } else {
-                        // Silence detected
-                        if last_speech_time.elapsed().as_millis() > SILENCE_DURATION_MS {
-                            // Auto-stop logic: we don't stop the loop, but we could notify UI.
-                            // For now, we just continue recording silence, but we could implement a signal.
-                            // To keep it simple and robust without changing UI logic too much:
-                            // We rely on the user to stop, OR we could introduce a "AutoStop" event.
-                            // Given current architecture, best is to just keep recording but maybe log it.
-                            // info!("Silence detected for > 2s");
+                        // Silence detecté
+                        if last_speech_time.elapsed().as_millis() > SILENCE_DURATION_MS && !buffer.is_empty() {
+                            info!("Silence auto-stop triggered");
+                            recording = false;
+                            
+                            let mut final_samples = process_buffer(&buffer, sample_rate);
+                            trim_silence(&mut final_samples, SILENCE_THRESHOLD);
+                            
+                            // Envoyer l'événement d'arrêt automatique
+                            let _ = event_tx.send(AudioEvent::AutoStopped(final_samples));
+                            
+                            buffer.clear(); // Reset buffer
                         }
                     }
 
-                    buffer.extend_from_slice(&chunk);
+                    if recording {
+                        buffer.extend_from_slice(&chunk);
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -184,6 +177,16 @@ fn run_audio_thread(
     Ok(())
 }
 
+// Helper pour traiter le buffer (resample)
+fn process_buffer(buffer: &[f32], sample_rate: u32) -> Vec<f32> {
+    if sample_rate != WHISPER_SAMPLE_RATE {
+        resample_simple(buffer, sample_rate, WHISPER_SAMPLE_RATE)
+    } else {
+        buffer.to_vec()
+    }
+}
+
+// ... (build_stream, get_preferred_config, resample_simple, trim_silence inchangés)
 fn build_stream<T>(
     device: &Device,
     config: &cpal::StreamConfig,
@@ -224,13 +227,11 @@ fn resample_simple(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
     let ratio = in_rate as f32 / out_rate as f32;
     let out_len = (input.len() as f32 / ratio) as usize;
     let mut output = Vec::with_capacity(out_len);
-    
     for i in 0..out_len {
         let index = i as f32 * ratio;
         let idx_floor = index.floor() as usize;
         let idx_ceil = (idx_floor + 1).min(input.len() - 1);
         let t = index - idx_floor as f32;
-        
         let sample = input[idx_floor] * (1.0 - t) + input[idx_ceil] * t;
         output.push(sample);
     }
@@ -241,7 +242,6 @@ fn trim_silence(samples: &mut Vec<f32>, threshold: f32) {
     if samples.is_empty() { return; }
     let start = samples.iter().position(|&x| x.abs() > threshold).unwrap_or(0);
     let end = samples.iter().rposition(|&x| x.abs() > threshold).unwrap_or(samples.len() - 1);
-
     if start >= end {
         samples.clear();
     } else {

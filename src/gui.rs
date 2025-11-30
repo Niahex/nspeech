@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Button, Box, Orientation, TextView, ScrolledWindow, TextBuffer};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use crate::audio::AudioRecorder;
+use crate::audio::{AudioRecorder, AudioEvent};
 use crate::transcription::TranscriptionManager;
 
 struct AppState {
@@ -16,7 +16,7 @@ enum AppMsg {
     InitError(String),
     TranscriptionSuccess(String),
     TranscriptionError(String),
-    AudioStopped(Vec<f32>),
+    AudioStopped(Vec<f32>), // Utilisé pour l'arrêt manuel ET automatique
     AudioStartError(String),
 }
 
@@ -54,16 +54,31 @@ pub fn build_ui(app: &Application) {
     window.set_child(Some(&vbox));
     window.present();
 
-    // App State (UI Thread side)
+    // App State
     let state = Arc::new(Mutex::new(None::<AppState>));
     
-    // Communication Channel (Async)
+    // Main Async Channel for UI
     let (sender, receiver) = async_channel::unbounded();
     
+    // Channel for Audio Events (MPSC -> Bridge -> Async Channel)
+    let (audio_event_tx, audio_event_rx) = std::sync::mpsc::channel();
+
+    // Bridge Thread: Audio Events (MPSC) -> UI Events (Async)
+    let sender_bridge = sender.clone();
+    thread::spawn(move || {
+        while let Ok(event) = audio_event_rx.recv() {
+            match event {
+                AudioEvent::AutoStopped(samples) => {
+                    let _ = sender_bridge.send_blocking(AppMsg::AudioStopped(samples));
+                }
+            }
+        }
+    });
+
     // Init Thread
     let sender_init = sender.clone();
     thread::spawn(move || {
-        let recorder = match AudioRecorder::new() {
+        let recorder = match AudioRecorder::new(audio_event_tx) {
             Ok(r) => r,
             Err(e) => {
                 let _ = sender_init.send_blocking(AppMsg::InitError(format!("Audio Init Failed: {}", e)));
@@ -80,12 +95,11 @@ pub fn build_ui(app: &Application) {
         let _ = sender_init.send_blocking(AppMsg::InitSuccess(Arc::new(Mutex::new(recorder)), transcriber));
     });
 
-    // Message Handler (Async Consumer on Main Context)
+    // UI Event Loop
     let state_clone = state.clone();
     let button_clone = record_button.clone();
     let buffer_clone = buffer.clone();
     let sender_clone = sender.clone();
-    // Fix ambiguous display call by using explicit trait
     let clipboard = gtk4::prelude::WidgetExt::display(&window).clipboard();
 
     glib::MainContext::default().spawn_local(async move {
@@ -107,9 +121,15 @@ pub fn build_ui(app: &Application) {
                 AppMsg::TranscriptionSuccess(text) => {
                     button_clone.set_label("Start Recording");
                     button_clone.set_sensitive(true);
+                    
                     let trimmed = text.trim();
-                    buffer_clone.set_text(trimmed);
-                    clipboard.set_text(trimmed);
+                    if !trimmed.is_empty() {
+                        buffer_clone.set_text(trimmed);
+                        clipboard.set_text(trimmed);
+                    } else {
+                        // Ignore empty transcriptions (often noise)
+                        buffer_clone.set_text("... (no speech detected)");
+                    }
                 }
                 AppMsg::TranscriptionError(e) => {
                     button_clone.set_label("Start Recording");
@@ -117,13 +137,22 @@ pub fn build_ui(app: &Application) {
                     buffer_clone.set_text(&format!("Error: {}", e));
                 }
                 AppMsg::AudioStopped(samples) => {
+                    // Mise à jour de l'état interne (important pour le bouton)
+                    let mut guard = state_clone.lock().unwrap();
+                    if let Some(app_state) = guard.as_mut() {
+                        app_state.is_recording = false;
+                    }
+                    
+                    // UI Update
+                    button_clone.set_label("Processing...");
+                    button_clone.set_sensitive(false);
+
                     if samples.is_empty() {
                         button_clone.set_label("Start Recording");
                         button_clone.set_sensitive(true);
-                        buffer_clone.set_text("No audio recorded (silence).");
+                        buffer_clone.set_text("No audio recorded.");
                     } else {
-                        // Start Transcription in Thread
-                        let guard = state_clone.lock().unwrap();
+                        // Start Transcription
                         if let Some(app_state) = guard.as_ref() {
                             let transcriber = app_state.transcriber.clone();
                             let sender_trans = sender_clone.clone();
@@ -153,14 +182,11 @@ pub fn build_ui(app: &Application) {
         let mut guard = state_clone.lock().unwrap();
         if let Some(app_state) = guard.as_mut() {
             if app_state.is_recording {
-                // Stop
-                button_clone.set_label("Processing...");
-                button_clone.set_sensitive(false);
-                app_state.is_recording = false;
-                
+                // STOP (Manuel)
                 let recorder = app_state.recorder.clone();
                 let sender_stop = sender_clone.clone();
                 
+                // On lance le stop dans un thread pour ne pas bloquer l'UI pendant le lock/channel
                 thread::spawn(move || {
                      let res = recorder.lock().unwrap().stop_recording();
                      match res {
@@ -169,7 +195,7 @@ pub fn build_ui(app: &Application) {
                      }
                 });
             } else {
-                // Start
+                // START
                 if let Err(e) = app_state.recorder.lock().unwrap().start_recording() {
                     let _ = sender_clone.send_blocking(AppMsg::AudioStartError(e.to_string()));
                 } else {
