@@ -15,8 +15,6 @@ impl TranscriptionManager {
     pub fn new(model_dir: &Path) -> Self {
         Self {
             engine: Arc::new(Mutex::new(None)),
-            // Optimisation : Utilisation du modèle "base" quantifié (q5_1)
-            // Plus léger (RAM) et plus rapide sur CPU/GPU
             model_path: model_dir.join("ggml-base-q5_1.bin"),
         }
     }
@@ -27,7 +25,6 @@ impl TranscriptionManager {
         }
 
         info!("Downloading optimized model to {:?}", self.model_path);
-        // URL du modèle quantifié officiel
         let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin";
         
         let runtime = tokio::runtime::Runtime::new()?;
@@ -51,7 +48,7 @@ impl TranscriptionManager {
         let mut guard = self.engine.lock().unwrap();
         *guard = Some(engine);
         
-        info!("Whisper model loaded (Optimized q5_1).");
+        info!("Whisper model loaded.");
         Ok(())
     }
 
@@ -59,9 +56,10 @@ impl TranscriptionManager {
         let mut guard = self.engine.lock().unwrap();
         let engine = guard.as_mut().ok_or(anyhow!("Engine not loaded"))?;
         
+        // Removed unsupported fields n_threads, temperature, beam_size
+        // transcribe-rs handles defaults internally.
         let params = WhisperInferenceParams {
             language: Some("fr".to_string()),
-            // Optimisation : Désactiver les sorties debug inutiles pour gagner un peu de temps CPU
             print_progress: false,
             print_realtime: false,
             print_timestamps: false,

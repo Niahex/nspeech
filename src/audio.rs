@@ -113,8 +113,6 @@ fn run_audio_thread(
 
     stream.play()?;
 
-    // Pre-allocate buffer for ~10 minutes of audio to avoid frequent reallocations
-    // 16000 Hz * 600 sec = 9,600,000 samples
     let mut buffer = Vec::with_capacity(16000 * 600);
     let mut recording = false;
 
@@ -129,13 +127,16 @@ fn run_audio_thread(
                 Cmd::Stop(reply_tx) => {
                     recording = false;
                     info!("Recording stopped, capturing {} samples", buffer.len());
-
-                    let final_samples = if sample_rate != WHISPER_SAMPLE_RATE {
+                    
+                    let mut final_samples = if sample_rate != WHISPER_SAMPLE_RATE {
                          resample_simple(&buffer, sample_rate, WHISPER_SAMPLE_RATE)
                     } else {
                         buffer.clone()
                     };
-
+                    
+                    // Optimization: Trim silence
+                    trim_silence(&mut final_samples, 0.01); // Threshold 1% amplitude
+                    
                     let _ = reply_tx.send(final_samples);
                 }
                 Cmd::Shutdown => break,
@@ -145,7 +146,6 @@ fn run_audio_thread(
         match sample_rx.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(chunk) => {
                 if recording {
-                    // Optimisation : Avoid extending if capacity exceeded too much, though Vec handles it.
                     buffer.extend_from_slice(&chunk);
                 }
             }
@@ -197,15 +197,37 @@ fn resample_simple(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
     let ratio = in_rate as f32 / out_rate as f32;
     let out_len = (input.len() as f32 / ratio) as usize;
     let mut output = Vec::with_capacity(out_len);
-
+    
     for i in 0..out_len {
         let index = i as f32 * ratio;
         let idx_floor = index.floor() as usize;
         let idx_ceil = (idx_floor + 1).min(input.len() - 1);
         let t = index - idx_floor as f32;
-
+        
         let sample = input[idx_floor] * (1.0 - t) + input[idx_ceil] * t;
         output.push(sample);
     }
     output
+}
+
+// Very basic silence trimming based on amplitude threshold
+fn trim_silence(samples: &mut Vec<f32>, threshold: f32) {
+    if samples.is_empty() { return; }
+
+    // Find start (first sample > threshold)
+    let start = samples.iter().position(|&x| x.abs() > threshold).unwrap_or(0);
+    
+    // Find end (last sample > threshold)
+    let end = samples.iter().rposition(|&x| x.abs() > threshold).unwrap_or(samples.len() - 1);
+
+    if start >= end {
+        samples.clear();
+    } else {
+        // Keep a little padding (0.2s = 3200 samples)
+        let padding = 3200;
+        let start_pad = start.saturating_sub(padding);
+        let end_pad = (end + padding).min(samples.len());
+        
+        *samples = samples[start_pad..end_pad].to_vec();
+    }
 }
