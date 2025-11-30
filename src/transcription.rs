@@ -15,7 +15,8 @@ impl TranscriptionManager {
     pub fn new(model_dir: &Path) -> Self {
         Self {
             engine: Arc::new(Mutex::new(None)),
-            model_path: model_dir.join("whisper-tiny.bin"),
+            // Utilisation du modèle "base" qui gère bien le français (multilingue)
+            model_path: model_dir.join("whisper-base.bin"),
         }
     }
 
@@ -25,7 +26,8 @@ impl TranscriptionManager {
         }
 
         info!("Downloading model to {:?}", self.model_path);
-        let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
+        // URL du modèle multilingue 'base'
+        let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
         
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
@@ -57,12 +59,12 @@ impl TranscriptionManager {
         let engine = guard.as_mut().ok_or(anyhow!("Engine not loaded"))?;
         
         let params = WhisperInferenceParams {
-            language: Some("en".to_string()),
+            // Configuration explicite pour le français
+            language: Some("fr".to_string()),
             ..Default::default()
         };
         
-        // Use correct method: transcribe_samples
-        let transcript = engine.transcribe_samples(audio_data.to_vec(), Some(params))
+        let transcript = TranscriptionEngine::transcribe_samples(engine, audio_data.to_vec(), Some(params))
              .map_err(|e| anyhow!("Transcription failed: {}", e))?;
             
         Ok(transcript.text)
