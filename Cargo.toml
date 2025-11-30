@@ -34,3 +34,16 @@ futures = "0.3.30"
 dirs = "5.0"
 walkdir = "2.5.0"
 uuid = { version = "1.8.0", features = ["v4"] }
+
+# --- Optimisations ---
+
+# Optimisation pour le mode "release" (production)
+[profile.release]
+lto = true        # Link Time Optimization : Réduit la taille et augmente la vitesse (plus long à compiler)
+codegen-units = 1 # Meilleure optimisation globale au prix d'une compilation plus lente
+strip = true      # Retire les symboles de debug pour réduire la taille du binaire
+
+# Optimisation des dépendances même en mode debug
+# Cela permet à l'appli d'être réactive sans devoir tout recompiler en release à chaque fois
+[profile.dev.package."*"]
+opt-level = 3
