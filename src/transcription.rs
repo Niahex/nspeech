@@ -56,13 +56,14 @@ impl TranscriptionManager {
         let mut guard = self.engine.lock().unwrap();
         let engine = guard.as_mut().ok_or(anyhow!("Engine not loaded"))?;
         
-        // Removed unsupported fields n_threads, temperature, beam_size
-        // transcribe-rs handles defaults internally.
         let params = WhisperInferenceParams {
             language: Some("fr".to_string()),
             print_progress: false,
             print_realtime: false,
             print_timestamps: false,
+            // Optimisation "Prompt Priming" : 
+            // Guide le style pour avoir de la ponctuation et une bonne syntaxe.
+            initial_prompt: Some("Voici une transcription claire, concise et bien ponctuée en français.".to_string()),
             ..Default::default()
         };
         
